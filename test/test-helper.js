@@ -710,6 +710,7 @@ const helper = {
         return prefix + ("000000000000000" + value.toString()).slice(-16);
     },
     ipPrefix: "127.0.0.",
+    proxyIpPrefix: "127.0.10.",
     ccm: ccm,
     ccmHelper: ccm,
     ads: ads,
