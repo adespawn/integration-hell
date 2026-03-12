@@ -5,6 +5,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,9 +21,9 @@ use napi_derive::napi;
 // without lifetime issues (Object<'_> can't be returned from #[napi] fns).
 // ---------------------------------------------------------------------------
 
-pub struct JsPromise(sys::napi_value);
+pub struct JsPromise<T>(sys::napi_value, PhantomData<T>);
 
-impl ToNapiValue for JsPromise {
+impl<T> ToNapiValue for JsPromise<T> {
   unsafe fn to_napi_value(_: sys::napi_env, val: Self) -> Result<sys::napi_value> {
     Ok(val.0)
   }
@@ -41,7 +42,7 @@ struct FutureEntry {
   /// main thread where we have a valid `napi_env`.
   deferred: sys::napi_deferred,
   waker: Waker,
-}
+} 
 
 // ---------------------------------------------------------------------------
 // WakerBridge — single TSFN, coalesced wake signals
@@ -161,8 +162,10 @@ impl FutureRegistry {
     }
   }
 
-  fn insert(&mut self, future: BoxFuture, deferred: sys::napi_deferred) -> u64 {
+  fn insert(&mut self, raw_env: sys::napi_env, future: BoxFuture, deferred: sys::napi_deferred) -> u64 {
     // println!("Inserting future with deferred {deferred:p}");
+    let was_empty = self.futures.is_empty();
+
     let id = self.next_id;
     self.next_id += 1;
 
@@ -173,12 +176,17 @@ impl FutureRegistry {
 
     self.futures.insert(id, FutureEntry { future, deferred, waker });
 
-    // Schedule the mandatory first poll.
-    {
-      let mut ids = self.bridge.woken_ids.lock().unwrap();
-      ids.push(id);
+    // If this is the first outstanding future, ref the TSFN so Node
+    // keeps its event loop alive until all futures have settled.
+    if was_empty {
+      let guard = self.bridge.tsfn.lock().unwrap();
+      if let Some(ref tsfn) = *guard {
+        unsafe { sys::napi_ref_threadsafe_function(raw_env, tsfn.raw()) };
+      }
     }
-    self.bridge.signal();
+
+    // Schedule the mandatory first poll.
+    self.bridge.wake(id);
 
     id
   }
@@ -193,11 +201,7 @@ impl FutureRegistry {
       std::mem::take(&mut *ids)
     };
 
-    let (now, later) = if woken.len() > POLL_BUDGET {
-      (&woken[..POLL_BUDGET], &woken[POLL_BUDGET..])
-    } else {
-      (&woken[..], &[][..])
-    };
+    let (now, later) = woken.split_at(woken.len().min(POLL_BUDGET));
 
     if !later.is_empty() {
       let mut ids = self.bridge.woken_ids.lock().unwrap();
@@ -227,6 +231,17 @@ impl FutureRegistry {
         }
       }
     }
+
+    // If every future has settled, unref the TSFN so Node can exit
+    // naturally.  The check happens *after* all polls so that a future
+    // completing synchronously and submitting a new future in its settle
+    // callback won't cause a premature unref.
+    if self.futures.is_empty() {
+      let guard = self.bridge.tsfn.lock().unwrap();
+      if let Some(ref tsfn) = *guard {
+        unsafe { sys::napi_unref_threadsafe_function(raw_env, tsfn.raw()) };
+      }
+    }
   }
 
   fn shutdown(&mut self) {
@@ -252,6 +267,33 @@ unsafe extern "C" fn noop_callback(
   _info: sys::napi_callback_info,
 ) -> sys::napi_value {
   std::ptr::null_mut()
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn create_promise(env: &Env) -> Result<(sys::napi_env, sys::napi_deferred, sys::napi_value)> {
+  let raw_env = env.raw();
+  let mut deferred: sys::napi_deferred = std::ptr::null_mut();
+  let mut promise: sys::napi_value = std::ptr::null_mut();
+  let status = unsafe { sys::napi_create_promise(raw_env, &mut deferred, &mut promise) };
+  if status != sys::Status::napi_ok {
+    return Err(Error::from_reason("napi_create_promise failed"));
+  }
+  Ok((raw_env, deferred, promise))
+}
+
+/// Safety: must be called on the main thread with a valid `napi_env`.
+unsafe fn reject_with_reason(env: sys::napi_env, deferred: sys::napi_deferred, reason: &str) {
+  let c_reason = CString::new(reason).unwrap_or_else(|_| CString::new("Unknown error").unwrap());
+  let mut msg: sys::napi_value = std::ptr::null_mut();
+  let mut error: sys::napi_value = std::ptr::null_mut();
+  unsafe {
+    sys::napi_create_string_utf8(env, c_reason.as_ptr(), c_reason.to_bytes().len() as isize, &mut msg);
+    sys::napi_create_error(env, std::ptr::null_mut(), msg, &mut error);
+    sys::napi_reject_deferred(env, deferred, error);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -308,65 +350,6 @@ pub fn init_poll_bridge(env: Env) -> Result<()> {
   Ok(())
 }
 
-/// Submit a Rust future to be polled directly by the Node event loop.
-///
-/// Returns a JS `Promise` that resolves when the future completes with
-/// `Ok(())`, or rejects when it completes with `Err(...)`.
-///
-/// The deferred is resolved/rejected directly via raw NAPI calls inside
-/// `poll_woken` (no extra TSFN round-trip since we're already on the
-/// main thread).
-pub fn submit_future<F>(env: &Env, fut: F) -> Result<JsPromise>
-where
-  F: Future<Output = Result<()>> + Send + 'static,
-{
-  let raw_env = env.raw();
-  let mut deferred: sys::napi_deferred = std::ptr::null_mut();
-  let mut promise: sys::napi_value = std::ptr::null_mut();
-
-  let status = unsafe { sys::napi_create_promise(raw_env, &mut deferred, &mut promise) };
-  if status != sys::Status::napi_ok {
-    return Err(Error::from_reason("napi_create_promise failed"));
-  }
-
-  let boxed: BoxFuture = Box::pin(async move {
-    match fut.await {
-      Ok(()) => Box::new(|env, deferred| {
-        let mut undefined: sys::napi_value = std::ptr::null_mut();
-        unsafe {
-          sys::napi_get_undefined(env, &mut undefined);
-          sys::napi_resolve_deferred(env, deferred, undefined);
-        }
-      }) as SettleCallback,
-      Err(e) => {
-        let reason = e.reason.to_string();
-        Box::new(move |env, deferred| {
-          let c_reason = CString::new(reason.as_str())
-            .unwrap_or_else(|_| CString::new("Unknown error").unwrap());
-          let mut msg: sys::napi_value = std::ptr::null_mut();
-          let mut error: sys::napi_value = std::ptr::null_mut();
-          unsafe {
-            sys::napi_create_string_utf8(
-              env,
-              c_reason.as_ptr(),
-              c_reason.to_bytes().len() as isize,
-              &mut msg,
-            );
-            sys::napi_create_error(env, std::ptr::null_mut(), msg, &mut error);
-            sys::napi_reject_deferred(env, deferred, error);
-          }
-        }) as SettleCallback
-      }
-    }
-  });
-
-  REGISTRY.with(|r| {
-    r.borrow_mut().insert(boxed, deferred);
-  });
-
-  Ok(JsPromise(promise))
-}
-
 /// Submit a typed Rust future to be polled directly by the Node event loop.
 ///
 /// Like `submit_future`, but the future can return a typed value `T` on success
@@ -375,87 +358,27 @@ where
 ///
 /// The error type `E` should produce a JS Error object from `to_napi_value` so
 /// that the rejection value is a proper error (e.g. `ConvertedError`).
-pub fn submit_future_typed<F, T, E>(env: &Env, fut: F) -> Result<JsPromise>
+pub fn submit_future<F, T, E>(env: &Env, fut: F) -> Result<JsPromise<T>>
 where
   F: Future<Output = std::result::Result<T, E>> + Send + 'static,
   T: napi::bindgen_prelude::ToNapiValue + Send + 'static,
   E: napi::bindgen_prelude::ToNapiValue + Send + 'static,
 {
-  let raw_env = env.raw();
-  let mut deferred: sys::napi_deferred = std::ptr::null_mut();
-  let mut promise: sys::napi_value = std::ptr::null_mut();
-
-  let status = unsafe { sys::napi_create_promise(raw_env, &mut deferred, &mut promise) };
-  if status != sys::Status::napi_ok {
-    return Err(Error::from_reason("napi_create_promise failed"));
-  }
+  let (raw_env, deferred, promise) = create_promise(env)?;
 
   let boxed: BoxFuture = Box::pin(async move {
     match fut.await {
       Ok(val) => Box::new(move |env, deferred| match unsafe { T::to_napi_value(env, val) } {
         Ok(v) => unsafe { sys::napi_resolve_deferred(env, deferred, v); },
-        Err(e) => {
-          let c_reason = CString::new(e.reason.as_str())
-            .unwrap_or_else(|_| CString::new("Unknown error").unwrap());
-          let mut msg: sys::napi_value = std::ptr::null_mut();
-          let mut error: sys::napi_value = std::ptr::null_mut();
-          unsafe {
-            sys::napi_create_string_utf8(
-              env,
-              c_reason.as_ptr(),
-              c_reason.to_bytes().len() as isize,
-              &mut msg,
-            );
-            sys::napi_create_error(env, std::ptr::null_mut(), msg, &mut error);
-            sys::napi_reject_deferred(env, deferred, error);
-          }
-        }
+        Err(e) => unsafe { reject_with_reason(env, deferred, e.reason.as_str()); },
       }) as SettleCallback,
       Err(err) => Box::new(move |env, deferred| match unsafe { E::to_napi_value(env, err) } {
         Ok(js_err) => unsafe { sys::napi_reject_deferred(env, deferred, js_err); },
-        Err(e) => {
-          let c_reason = CString::new(e.reason.as_str())
-            .unwrap_or_else(|_| CString::new("Unknown error").unwrap());
-          let mut msg: sys::napi_value = std::ptr::null_mut();
-          let mut error: sys::napi_value = std::ptr::null_mut();
-          unsafe {
-            sys::napi_create_string_utf8(
-              env,
-              c_reason.as_ptr(),
-              c_reason.to_bytes().len() as isize,
-              &mut msg,
-            );
-            sys::napi_create_error(env, std::ptr::null_mut(), msg, &mut error);
-            sys::napi_reject_deferred(env, deferred, error);
-          }
-        }
+        Err(e) => unsafe { reject_with_reason(env, deferred, e.reason.as_str()); },
       }) as SettleCallback,
     }
   });
 
-  REGISTRY.with(|r| {
-    r.borrow_mut().insert(boxed, deferred);
-  });
-
-  Ok(JsPromise(promise))
-}
-
-
-// ---------------------------------------------------------------------------
-// Example: a bridged async function exposed to JS
-// ---------------------------------------------------------------------------
-
-/// Sleep for `ms` milliseconds using tokio::time (driven by the dedicated
-/// reactor thread), then return.  Demonstrates a future polled directly by
-/// the Node event loop via the WakerBridge.
-#[napi(ts_return_type = "Promise<void>")]
-pub fn bridged_sleep(env: Env, ms: u32) -> Result<JsPromise> {
-  // println!("bridged_sleep called with {ms} ms");
-  let dur = std::time::Duration::from_millis(ms as u64);
-  submit_future(&env, async move {
-    // println!("Sleeping for {ms} ms...");
-    tokio::time::sleep(dur).await;
-    // println!("Done sleeping for {ms} ms");
-    Ok(())
-  })
+  REGISTRY.with(|r| r.borrow_mut().insert(raw_env, boxed, deferred));
+  Ok(JsPromise(promise, PhantomData))
 }

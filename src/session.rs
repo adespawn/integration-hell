@@ -20,15 +20,15 @@ use scylla::policies::retry::{DefaultRetryPolicy, FallthroughRetryPolicy, RetryP
 use scylla::response::{PagingState, PagingStateResponse};
 use scylla::statement::batch::Batch;
 use scylla::statement::{Consistency, SerialConsistency, Statement};
-
-use crate::errors::{
+use crate::casync::{JsPromise, submit_future};use crate::errors::{
     ConvertedError, ConvertedResult, JsResult, make_js_error,
     with_custom_error_sync,
 };
 use crate::options;
-use crate::paging::{PagingResult, PagingStateWrapper};
+use crate::paging::{PagingResult, PagingResultWithExecutor, PagingStateWrapper};
 use crate::requests::request::{QueryOptionsObj, QueryOptionsWrapper};
 use crate::types::encoded_data::EncodedValuesWrapper;
+use crate::types::type_wrappers::ComplexType;
 use crate::utils::bigint_to_i64;
 use crate::utils::from_napi_obj::define_js_to_rust_convertible_object;
 use crate::{requests::request::PreparedStatementWrapper, result::QueryResultWrapper};
@@ -162,13 +162,13 @@ impl QueryExecutor {
         env: Env,
         session: &SessionWrapper,
         paging_state: Option<&PagingStateWrapper>,
-    ) -> napi::Result<crate::casync::JsPromise> {
+    ) -> napi::Result<JsPromise<PagingResult>> {
         let params = Arc::clone(&self.params);
         let statement = Arc::clone(&self.statement);
         let is_prepared = self.is_prepared;
         let session_inner = Arc::clone(&session.inner);
         let paging_state_inner = paging_state.map(|p| p.inner.clone());
-        crate::casync::submit_future_typed::<_, _, ConvertedError>(&env, async move {
+        submit_future::<_, _, ConvertedError>(&env, async move {
             let paging_state = paging_state_inner.unwrap_or(PagingState::start());
             let (result, paging_state_response) = if is_prepared {
                 session_inner
@@ -205,8 +205,8 @@ impl QueryExecutor {
 impl SessionWrapper {
     /// Creates session based on the provided session options.
     #[napi(ts_return_type = "Promise<SessionWrapper>")]
-    pub fn create_session(env: Env, options: SessionOptions) -> napi::Result<crate::casync::JsPromise> {
-        crate::casync::submit_future_typed::<_, _, ConvertedError>(&env, async move {
+    pub fn create_session(env: Env, options: SessionOptions) -> napi::Result<JsPromise<SessionWrapper>> {
+        submit_future::<_, _, ConvertedError>(&env, async move {
             let builder = configure_session_builder(&options)?;
             let session = builder.build().await?;
             let session: CachingSession = CachingSession::from(
@@ -241,12 +241,12 @@ impl SessionWrapper {
         query: String,
         params: Vec<EncodedValuesWrapper>,
         options: &QueryOptionsWrapper,
-    ) -> napi::Result<crate::casync::JsPromise> {
+    ) -> napi::Result<JsPromise<QueryResultWrapper>> {
         let statement = self
             .apply_statement_options(query.into(), &options.options)
             .map_err(|e| make_js_error(e))?;
         let inner = Arc::clone(&self.inner);
-        crate::casync::submit_future_typed::<_, _, ConvertedError>(&env, async move {
+        submit_future::<_, _, ConvertedError>(&env, async move {
             let query_result = inner.get_session().query_unpaged(statement, params).await?;
             QueryResultWrapper::from_query(query_result)
         })
@@ -259,9 +259,9 @@ impl SessionWrapper {
         &self,
         env: Env,
         statement: String,
-    ) -> napi::Result<crate::casync::JsPromise> {
+    ) -> napi::Result<JsPromise<Vec<ComplexType<'static>>>> {
         let inner = Arc::clone(&self.inner);
-        crate::casync::submit_future_typed::<_, _, ConvertedError>(&env, async move {
+        submit_future::<_, _, ConvertedError>(&env, async move {
             let statement: Statement = statement.into();
             let w = PreparedStatementWrapper {
                 prepared: inner
@@ -289,12 +289,12 @@ impl SessionWrapper {
         query: String,
         params: Vec<EncodedValuesWrapper>,
         options: &QueryOptionsWrapper,
-    ) -> napi::Result<crate::casync::JsPromise> {
+    ) -> napi::Result<JsPromise<QueryResultWrapper>> {
         let query = self
             .apply_statement_options(query.into(), &options.options)
             .map_err(|e| make_js_error(e))?;
         let inner = Arc::clone(&self.inner);
-        crate::casync::submit_future_typed::<_, _, ConvertedError>(&env, async move {
+        submit_future::<_, _, ConvertedError>(&env, async move {
             QueryResultWrapper::from_query(inner.execute_unpaged(query, params).await?)
         })
     }
@@ -308,10 +308,10 @@ impl SessionWrapper {
         env: Env,
         batch: &BatchWrapper,
         params: Vec<Vec<EncodedValuesWrapper>>,
-    ) -> napi::Result<crate::casync::JsPromise> {
+    ) -> napi::Result<JsPromise<QueryResultWrapper>> {
         let batch = batch.inner.clone();
         let inner = Arc::clone(&self.inner);
-        crate::casync::submit_future_typed::<_, _, ConvertedError>(&env, async move {
+        submit_future::<_, _, ConvertedError>(&env, async move {
             QueryResultWrapper::from_query(inner.batch(&batch, params).await?)
         })
     }
@@ -329,7 +329,7 @@ impl SessionWrapper {
         params: Vec<EncodedValuesWrapper>,
         options: &QueryOptionsWrapper,
         paging_state: Option<&PagingStateWrapper>,
-    ) -> napi::Result<crate::casync::JsPromise> {
+    ) -> napi::Result<JsPromise<PagingResultWithExecutor>> {
         let statement = Arc::new(
             self.apply_statement_options(query.into(), &options.options)
                 .map_err(|e| make_js_error(e))?,
@@ -337,7 +337,7 @@ impl SessionWrapper {
         let params = Arc::new(params);
         let paging_state_inner = paging_state.map(|p| p.inner.clone());
         let inner = Arc::clone(&self.inner);
-        crate::casync::submit_future_typed::<_, _, ConvertedError>(&env, async move {
+        submit_future::<_, _, ConvertedError>(&env, async move {
             let paging_state = paging_state_inner.unwrap_or(PagingState::start());
             let (result, paging_state_response) = inner
                 .get_session()
@@ -374,7 +374,7 @@ impl SessionWrapper {
         params: Vec<EncodedValuesWrapper>,
         options: &QueryOptionsWrapper,
         paging_state: Option<&PagingStateWrapper>,
-    ) -> napi::Result<crate::casync::JsPromise> {
+    ) -> napi::Result<JsPromise<PagingResultWithExecutor>> {
         let statement = Arc::new(
             self.apply_statement_options(query.into(), &options.options)
                 .map_err(|e| make_js_error(e))?,
@@ -382,7 +382,7 @@ impl SessionWrapper {
         let params = Arc::new(params);
         let paging_state_inner = paging_state.map(|p| p.inner.clone());
         let inner = Arc::clone(&self.inner);
-        crate::casync::submit_future_typed::<_, _, ConvertedError>(&env, async move {
+        submit_future::<_, _, ConvertedError>(&env, async move {
             let paging_state = paging_state_inner.unwrap_or(PagingState::start());
             let (result, paging_state_response) = inner
                 .execute_single_page(
