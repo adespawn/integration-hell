@@ -7,6 +7,7 @@ use std::ffi::CString;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
@@ -18,11 +19,8 @@ use napi_derive::napi;
 
 use crate::errors::ConvertedError;
 
-// ---------------------------------------------------------------------------
-// JsPromise — lightweight wrapper so #[napi] fns can return a raw Promise
-// without lifetime issues (Object<'_> can't be returned from #[napi] fns).
-// ---------------------------------------------------------------------------
-
+/// JsPromise — lightweight wrapper so #\[napi] fns can return a raw Promise
+/// without lifetime issues (Object<'_> can't be returned from #\[napi] fns).
 pub struct JsPromise<T>(sys::napi_value, PhantomData<T>);
 
 impl<T> ToNapiValue for JsPromise<T> {
@@ -32,11 +30,6 @@ impl<T> ToNapiValue for JsPromise<T> {
         Ok(val.0)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
 type SettleCallback = Box<dyn FnOnce(sys::napi_env, sys::napi_deferred) + Send>;
 type BoxFuture = Pin<Box<dyn Future<Output = SettleCallback> + Send>>;
 
@@ -49,7 +42,7 @@ struct FutureEntry {
 }
 
 // ---------------------------------------------------------------------------
-// WakerBridge — single TSFN, coalesced wake signals
+// WakerBridge — single Thread safe function, coalesced wake signals
 // ---------------------------------------------------------------------------
 
 type Tsfn = napi::threadsafe_function::ThreadsafeFunction<(), (), (), Status, false, true, 0>;
@@ -94,10 +87,7 @@ impl WakerBridge {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Per-future waker internals
-// ---------------------------------------------------------------------------
-
+/// Per-future waker internals
 struct WakerInner {
     future_id: u64,
     bridge: Arc<WakerBridge>,
@@ -113,12 +103,7 @@ impl Wake for WakerInner {
     }
 }
 
-// ---------------------------------------------------------------------------
-// FutureRegistry — thread-local, lives on the Node main thread
-// ---------------------------------------------------------------------------
-
-const POLL_BUDGET: usize = 128;
-
+/// FutureRegistry — thread-local, lives on the Node main thread
 struct FutureRegistry {
     futures: HashMap<u64, FutureEntry>,
     next_id: u64,
@@ -191,17 +176,9 @@ impl FutureRegistry {
             std::mem::take(&mut *ids)
         };
 
-        let (now, later) = woken.split_at(woken.len().min(POLL_BUDGET));
-
-        if !later.is_empty() {
-            let mut ids = self.bridge.woken_ids.lock().unwrap();
-            ids.extend_from_slice(later);
-            self.bridge.signal();
-        }
-
         // Take-and-process: remove entries before polling so that a polled
         // future can register *new* futures without hitting RefCell deadlock.
-        let entries: Vec<(u64, FutureEntry)> = now
+        let entries: Vec<(u64, FutureEntry)> = woken
             .iter()
             .filter_map(|&id| self.futures.remove(&id).map(|e| (id, e)))
             .collect();
@@ -252,32 +229,27 @@ thread_local! {
 
 #[napi(no_export)]
 fn noop_callback() {
-    // No-op callback for creating the TSFN.  The actual wake signal is sent
-    // by calling `tsfn.call((), ThreadsafeFunctionCallMode::NonBlocking)` from
-    // the WakerBridge, so this function is never invoked.
+    // No-op callback for creating the ThreadsafeFunction.
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn create_promise(env: &Env) -> Result<(sys::napi_env, sys::napi_deferred, sys::napi_value)> {
-    let raw_env = env.raw();
-    let mut deferred: sys::napi_deferred = std::ptr::null_mut();
-    let mut promise: sys::napi_value = std::ptr::null_mut();
+fn create_promise(env: &Env) -> Result<(sys::napi_deferred, sys::napi_value)> {
+    let mut deferred = ptr::null_mut();
+    let mut promise= ptr::null_mut();
     // SAFETY: `raw_env` is taken from Env, which is guaranteed to be valid for the lifetime of the current napi call.
-    let status = unsafe { sys::napi_create_promise(raw_env, &mut deferred, &mut promise) };
+    let status = unsafe { sys::napi_create_promise(env.raw(), &mut deferred, &mut promise) };
     if status != sys::Status::napi_ok {
         return Err(Error::from_reason("napi_create_promise failed"));
     }
-    Ok((raw_env, deferred, promise))
+    Ok((deferred, promise))
 }
 
 /// Safety: must be called on the main thread with a valid `napi_env`.
 unsafe fn reject_with_reason(env: sys::napi_env, deferred: sys::napi_deferred, reason: &str) {
-    let c_reason = CString::new(reason).unwrap_or_else(|_| CString::new("Unknown error").unwrap());
+    // We can unwrap in the second place, because the only case when Cstring::new can fail is when the string contains a null byte.
+    let c_reason = CString::new(reason).unwrap_or_else(|_| CString::new("[Unknown error] Error message contained illegal null byte").unwrap());
     let mut msg: sys::napi_value = std::ptr::null_mut();
     let mut error: sys::napi_value = std::ptr::null_mut();
+
     // SAFETY: Caller guarantees `env` is a valid main-thread env and `deferred`
     // has not yet been resolved or rejected. `c_reason` is a valid C string kept
     // alive for the duration of these calls. `msg` is initialized by
@@ -290,7 +262,7 @@ unsafe fn reject_with_reason(env: sys::napi_env, deferred: sys::napi_deferred, r
             c_reason.to_bytes().len() as isize,
             &mut msg,
         );
-        sys::napi_create_error(env, std::ptr::null_mut(), msg, &mut error);
+        sys::napi_create_error(env, ptr::null_mut(), msg, &mut error);
         sys::napi_reject_deferred(env, deferred, error);
     }
 }
@@ -363,7 +335,7 @@ where
     T: napi::bindgen_prelude::ToNapiValue + Send + 'static,
     E: Into<ConvertedError> + Send + 'static,
 {
-    let (raw_env, deferred, promise) = create_promise(env)?;
+    let (deferred, promise) = create_promise(env)?;
 
     let boxed: BoxFuture = Box::pin(async move {
         let result = fut.await;
@@ -389,6 +361,6 @@ where
         }) as SettleCallback
     });
 
-    REGISTRY.with(|r| r.borrow_mut().insert(raw_env, boxed, deferred));
+    REGISTRY.with(|r| r.borrow_mut().insert(env.raw(), boxed, deferred));
     Ok(JsPromise(promise, PhantomData))
 }
