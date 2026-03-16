@@ -1,6 +1,3 @@
-#![deny(clippy::all)]
-#![allow(clippy::arc_with_non_send_sync)]
-
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -12,41 +9,42 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 
-use napi::bindgen_prelude::*;
-use napi::sys;
+// While check_status macro is doc(hidden), it implements a simple checks that convert c errors into Rust Results
+// Implementation: https://github.com/napi-rs/napi-rs/blob/f2178312d0e3e07beecc19836b91716a229107d3/crates/napi/src/error.rs#L35
+use napi::bindgen_prelude::{ToNapiValue, check_status};
 use napi::threadsafe_function::ThreadsafeFunctionCallMode;
+use napi::{Env, Error, Result, Status, sys};
 use napi_derive::napi;
 
-use crate::errors::{ConvertedError, ConvertedResult};
+use crate::errors::{ConvertedError, ConvertedResult, JsResult, with_custom_error_sync};
 
-/// JsPromise — lightweight wrapper so #\[napi] fns can return a raw Promise
-/// without lifetime issues (Object<'_> can't be returned from #\[napi] fns).
+/// JsPromise — lightweight wrapper over the promise pointer that indicates the type used to resolve the promise
+/// The promise can be either resolved with type T or rejected with any error value (`ConvertedError` when used with `submit_future`).
 pub struct JsPromise<T>(sys::napi_value, PhantomData<T>);
 
 impl<T> ToNapiValue for JsPromise<T> {
+    /// # Safety
+    /// No constraints on safety. The unsafe is required by the trait.
     unsafe fn to_napi_value(_: sys::napi_env, val: Self) -> Result<sys::napi_value> {
-        // SAFETY: `val.0` is the raw `napi_value` returned by `napi_create_promise`
-        // on the same env; it remains valid for the lifetime of the current napi call.
         Ok(val.0)
     }
 }
+
 type SettleCallback = Box<dyn FnOnce(Env, sys::napi_deferred) + Send>;
-type BoxFuture = Pin<Box<dyn Future<Output = SettleCallback> + Send>>;
+type BridgedFuture = Pin<Box<dyn Future<Output = SettleCallback> + Send>>;
 
 struct FutureEntry {
-    future: BoxFuture,
+    future: BridgedFuture,
     /// Raw deferred handle — resolved/rejected in `poll_woken` on the
     /// main thread where we have a valid `napi_env`.
     deferred: sys::napi_deferred,
     waker: Waker,
 }
 
-// ---------------------------------------------------------------------------
-// WakerBridge — single Thread safe function, coalesced wake signals
-// ---------------------------------------------------------------------------
+/// No argument no return value, weak ThreadSafeFunction type.
+type Tsfn = napi::threadsafe_function::ThreadsafeFunction<(), (), (), Status, false, true>;
 
-type Tsfn = napi::threadsafe_function::ThreadsafeFunction<(), (), (), Status, false, true, 0>;
-
+/// Single instance of thread safe function, coalesced wake signals
 struct WakerBridge {
     woken_ids: Arc<Mutex<Vec<u64>>>,
     signaled: Arc<AtomicBool>,
@@ -127,7 +125,7 @@ impl FutureRegistry {
     fn insert(
         &mut self,
         env: &Env,
-        future: BoxFuture,
+        future: BridgedFuture,
         deferred: sys::napi_deferred,
     ) -> Result<u64> {
         let was_empty = self.futures.is_empty();
@@ -198,29 +196,31 @@ impl FutureRegistry {
             }
         }
 
+        if !self.futures.is_empty() {
+            return;
+        }
         // If every future has settled, unref the TSFN so Node can exit
         // naturally.  The check happens *after* all polls so that a future
         // completing synchronously and submitting a new future in its settle
         // callback won't cause a premature unref.
-        if self.futures.is_empty() {
-            let guard = self.bridge.tsfn.lock().unwrap();
-            if let Some(ref tsfn) = *guard {
-                // SAFETY: Env guarantees a valid `napi_env` for the current call.
-                //  `tsfn.raw()` is live because we hold the Mutex lock.
-                let status = unsafe {
-                    check_status!(sys::napi_unref_threadsafe_function(env.raw(), tsfn.raw()))
-                };
-                if let Err(e) = status {
-                    // We should fail here only in extreme cases (e.g. TSFN already unrefed, env invalid, etc.) — panic is warranted.
-                    panic!(
-                        "Failed to unref TSFN in poll_woken. This may indicate either a bug in the driver or a severe runtime error.\nRoot cause:\n {}",
-                        e.reason
-                    );
-                }
-            }
+        let guard = self.bridge.tsfn.lock().unwrap();
+        let Some(ref tsfn) = *guard else {
+            return;
+        };
+        // SAFETY: Env guarantees a valid `napi_env` for the current call.
+        //  `tsfn.raw()` is live because we hold the Mutex lock.
+        let status =
+            unsafe { check_status!(sys::napi_unref_threadsafe_function(env.raw(), tsfn.raw())) };
+        if let Err(e) = status {
+            // We should fail here only in extreme cases (e.g. TSFN already unrefed, env invalid, etc.) — panic is warranted.
+            panic!(
+                "Failed to unref TSFN in poll_woken. This may indicate either a bug in the driver or a severe runtime error.\nRoot cause:\n {}",
+                e.reason
+            );
         }
     }
 
+    // This function is registered in the startup to be called during node cleanup process.
     fn shutdown(&mut self) {
         self.futures.clear();
         *self.bridge.tsfn.lock().unwrap() = None;
@@ -232,11 +232,6 @@ impl FutureRegistry {
 
 thread_local! {
   static REGISTRY: RefCell<FutureRegistry> = RefCell::new(FutureRegistry::new());
-}
-
-#[napi(no_export)]
-fn noop_callback() {
-    // No-op callback for creating the ThreadsafeFunction.
 }
 
 fn create_promise(env: &Env) -> Result<(sys::napi_deferred, sys::napi_value)> {
@@ -253,7 +248,9 @@ fn create_promise(env: &Env) -> Result<(sys::napi_deferred, sys::napi_value)> {
     Ok((deferred, promise))
 }
 
-fn reject_with_reason(env: Env, deferred: sys::napi_deferred, reason: &str) -> Result<()> {
+/// # Safety
+/// The deferred must not have been resolved or rejected yet
+unsafe fn reject_with_reason(env: Env, deferred: sys::napi_deferred, reason: &str) -> Result<()> {
     // We can unwrap in the second place, because the only case when Cstring::new can fail is when the string contains a null byte.
     let c_reason = CString::new(reason).unwrap_or_else(|_| {
         CString::new("[Unknown error] Error message contained illegal null byte").unwrap()
@@ -261,14 +258,10 @@ fn reject_with_reason(env: Env, deferred: sys::napi_deferred, reason: &str) -> R
     let mut msg: sys::napi_value = std::ptr::null_mut();
     let mut error: sys::napi_value = std::ptr::null_mut();
 
-    // SAFETY: Caller guarantees `env` is a valid main-thread env and `deferred`
-    // has not yet been resolved or rejected. `c_reason` is a valid C string kept
-    // alive for the duration of these calls. `msg` is initialized by
-    // `napi_create_string_utf8` before being passed to `napi_create_error`, and
-    // `error` is initialized by `napi_create_error` before `napi_reject_deferred`.
+    // SAFETY: Env guarantees that raw pointer is a valid main-thread env and
+    // caller ensured that `deferred` has not yet been resolved or rejected.
+    // Remaining arguments are created in this function and are valid for the whole duration.
     unsafe {
-        // While this macro is doc(hidden), it implements a simple checks that convert c errors into Rust Results
-        // Implementation: https://github.com/napi-rs/napi-rs/blob/f2178312d0e3e07beecc19836b91716a229107d3/crates/napi/src/error.rs#L357
         check_status!(sys::napi_create_string_utf8(
             env.raw(),
             c_reason.as_ptr(),
@@ -286,9 +279,10 @@ fn reject_with_reason(env: Env, deferred: sys::napi_deferred, reason: &str) -> R
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// NAPI exports
-// ---------------------------------------------------------------------------
+#[napi(no_export)]
+fn noop_callback() {
+    // No-op callback for creating the ThreadsafeFunction.
+}
 
 /// Initialize the direct-poll bridge.  Must be called once before any
 /// bridged async function. This function must be called only once.
@@ -297,62 +291,60 @@ fn reject_with_reason(env: Env, deferred: sys::napi_deferred, reason: &str) -> R
 /// thread drives the reactor (epoll/kqueue). A single weak TSFN is used
 /// as the cross-thread wake mechanism — ABI-stable, cross-platform, no
 /// direct libuv dependency.
-///
-/// Panic handling: if the Tokio worker thread panics the process aborts.
-/// This is the simplest strategy — no silent hangs, no orphaned promises.
 #[napi]
-pub fn init_poll_bridge(env: Env) -> Result<()> {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .build()
-        .map_err(|e| Error::from_reason(format!("tokio runtime init failed: {e}")))?;
+pub fn init_poll_bridge(env: Env) -> JsResult<()> {
+    with_custom_error_sync(|| {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()?;
 
-    // Create the TSFN from a no-op C callback.
-    // `build_callback` replaces the JS call — the noop is never invoked.
-    let noop_fn = env.create_function::<(), ()>("pollBridgeNoop", noop_callback_c_callback)?;
+        // Create the TSFN from any c callback. This callback will be replaced in the build_callback step,
+        // but we still need to provide c function, to use napi-rs callback builder.
+        // We could do this directly through node-api interface, but here napi-rs simplifies this process.
+        // We also have to use callback witch matching type, to ensure everything runs correctly.
+        let noop_fn = env.create_function::<(), ()>("pollBridgeNoop", noop_callback_c_callback)?;
 
-    let tsfn = noop_fn
-        .build_threadsafe_function::<()>()
-        .weak::<true>()
-        .build_callback(|ctx| {
-            let raw_env = ctx.env;
+        let tsfn = noop_fn
+            .build_threadsafe_function::<()>()
+            // We will manually ref/unref this tsfn based on whether we have outstanding futures.
+            .weak::<true>()
+            .build_callback(|ctx| {
+                let raw_env = ctx.env;
+                REGISTRY.with(|r| {
+                    r.borrow_mut().poll_woken(raw_env);
+                });
+                Ok(())
+            })?;
+
+        REGISTRY.with(|r| {
+            let mut reg = r.borrow_mut();
+            reg.tokio_rt = Some(rt);
+            reg.bridge.set_tsfn(tsfn);
+        });
+
+        // Cleanup hook — shut down the runtime when Node exits.
+        env.add_env_cleanup_hook((), |_| {
             REGISTRY.with(|r| {
-                r.borrow_mut().poll_woken(raw_env);
+                r.borrow_mut().shutdown();
             });
-            Ok(())
         })?;
 
-    REGISTRY.with(|r| {
-        let mut reg = r.borrow_mut();
-        reg.tokio_rt = Some(rt);
-        reg.bridge.set_tsfn(tsfn);
-    });
+        if INITIALIZED.swap(true, Ordering::SeqCst) {
+            return Err(Error::from_reason(
+                "init_poll_bridge can only be called once",
+            ));
+        }
 
-    // Cleanup hook — shut down the runtime when Node exits.
-    env.add_env_cleanup_hook((), |_| {
-        REGISTRY.with(|r| {
-            r.borrow_mut().shutdown();
-        });
-    })?;
-
-    if INITIALIZED.swap(true, Ordering::SeqCst) {
-        return Err(Error::from_reason(
-            "init_poll_bridge can only be called once",
-        ));
-    }
-
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Submit a typed Rust future to be polled directly by the Node event loop.
 ///
 /// Future can return a typed value `T` on success
-/// or an error `E` on failure. Both `T` and `E` are converted to JS values via
+/// or a `ConvertedError` on failure. Both `T` and `ConvertedError` are converted to JS values via
 /// `ToNapiValue` on the main thread when the future settles.
-///
-/// The error type `E` should produce a JS Error object from `to_napi_value` so
-/// that the rejection value is a proper error (e.g. `ConvertedError`).
 pub fn submit_future<F, T>(env: &Env, fut: F) -> ConvertedResult<JsPromise<T>>
 where
     F: Future<Output = std::result::Result<T, ConvertedError>> + Send + 'static,
@@ -366,7 +358,7 @@ where
 
     let (deferred, promise) = create_promise(env)?;
 
-    let boxed: BoxFuture = Box::pin(async move {
+    let boxed: BridgedFuture = Box::pin(async move {
         let result = fut.await;
         Box::new(move |env: Env, deferred| unsafe {
             // SAFETY: This closure is only ever invoked from `poll_woken`, which runs
@@ -404,5 +396,6 @@ where
     });
 
     REGISTRY.with(|r| r.borrow_mut().insert(env, boxed, deferred))?;
+    REGISTRY.with(|r| r.borrow_mut().poll_woken(*env));
     Ok(JsPromise(promise, PhantomData))
 }
