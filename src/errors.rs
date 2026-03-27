@@ -130,6 +130,12 @@ where
     }
 }
 
+impl std::fmt::Display for ConvertedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.name, self.msg)
+    }
+}
+
 impl ToNapiValue for ConvertedError {
     /// # Safety
     ///
