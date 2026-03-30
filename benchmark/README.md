@@ -63,6 +63,8 @@ Result will be saved to `out.svg`. You can read more in the benchmarker document
 
 ## Legacy python script
 
+This script is no longer updated, so it may be broken.
+
 A file that runs all benchmarks: `runner.py`
 
 The script compares benchmark results for our driver, [Cassandra driver](https://github.com/apache/cassandra-nodejs-driver) and [Rust driver](https://github.com/scylladb/scylla-rust-driver). Parameters for the benchmarks can be modified inside it. The result is a `graph.png` file that presents a graph of time on a logarithmic scale. The graphs are uploaded to the provided discord webhook.
