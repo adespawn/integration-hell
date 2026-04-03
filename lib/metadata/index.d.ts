@@ -5,7 +5,7 @@ import Uuid = types.Uuid;
 import InetAddress = types.InetAddress;
 
 export interface Aggregate {
-    argumentTypes: Array<{ code: dataTypes; info: any }>;
+    argumentTypes: DataTypeInfo[];
     finalFunction: string;
     initCondition: string;
     keyspaceName: string;
@@ -26,13 +26,14 @@ export interface ClientState {
   }
 
 export interface DataTypeInfo {
-    code: dataTypes;
-    info: string | DataTypeInfo | DataTypeInfo[];
-    options: {
-      frozen: boolean;
-      reversed: boolean;
-    };
-  }
+  code: number;
+
+  info: null | string | DataTypeInfo | DataTypeInfo[] | [DataTypeInfo, DataTypeInfo] | [DataTypeInfo, number] | { name: string; keyspace?: string; fields: Array<{ name: string; type: DataTypeInfo }> };
+
+  options?: { frozen?: boolean; reversed?: boolean };
+
+  customTypeName?: string;
+}
 
 export interface ColumnInfo {
     name: string;
@@ -99,7 +100,7 @@ export interface QueryTrace {
 
 export interface SchemaFunction {
     argumentNames: string[];
-    argumentTypes: Array<{ code: dataTypes; info: any }>;
+    argumentTypes: DataTypeInfo[];
     body: string;
     calledOnNullInput: boolean;
     keyspaceName: string;
@@ -149,14 +150,14 @@ export interface Metadata {
     getAggregate(
       keyspaceName: string,
       name: string,
-      signature: string[] | Array<{ code: number; info: any }>,
+      signature: string[] | DataTypeInfo[],
       callback: ValueCallback<Aggregate>,
     ): void;
 
     getAggregate(
       keyspaceName: string,
       name: string,
-      signature: string[] | Array<{ code: number; info: any }>,
+      signature: string[] | DataTypeInfo[],
     ): Promise<Aggregate>;
 
     getAggregates(
@@ -170,14 +171,14 @@ export interface Metadata {
     getFunction(
       keyspaceName: string,
       name: string,
-      signature: string[] | Array<{ code: number; info: any }>,
+      signature: string[] | DataTypeInfo[],
       callback: ValueCallback<SchemaFunction>,
     ): void;
 
     getFunction(
       keyspaceName: string,
       name: string,
-      signature: string[] | Array<{ code: number; info: any }>,
+      signature: string[] | DataTypeInfo[],
     ): Promise<SchemaFunction>;
 
     getFunctions(

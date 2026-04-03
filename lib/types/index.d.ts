@@ -315,7 +315,7 @@ export interface ResultSet extends Iterable<Row>, AsyncIterable<Row> {
     customPayload: any;
   };
 
-  columns: Array<{ name: string; type: { code: dataTypes; info: any } }>;
+  columns: Array<{ name: string; type: DataTypeInfo }>;
   nextPage: (() => void) | null;
   pageState: string;
   rowLength: number;
@@ -433,3 +433,5 @@ export class Vector {
 
   [Symbol.iterator](): IterableIterator<any>;
 }
+
+export { DataTypeInfo } from '../metadata';
