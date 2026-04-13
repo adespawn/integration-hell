@@ -56,4 +56,58 @@ macro_rules! define_rust_to_js_convertible_object {
     };
 }
 
+/// Structure that converts a Rust Map into JS object
+pub struct NamedMap<K, V, W>
+where
+    K: ToString,
+    W: ToNapiValue,
+    V: Into<W>,
+{
+    pub(crate) map: HashMap<K, V>,
+    _p: PhantomData<W>,
+}
+
+impl<K, V, W> NamedMap<K, V, W>
+where
+    K: ToString,
+    W: ToNapiValue,
+    V: Into<W>,
+{
+    pub(crate) fn new(v: HashMap<K, V>) -> Self {
+        NamedMap {
+            map: v,
+            _p: PhantomData,
+        }
+    }
+}
+
+impl<K, V, W> ToNapiValue for NamedMap<K, V, W>
+where
+    K: ToString,
+    W: ToNapiValue,
+    V: Into<W>,
+{
+    unsafe fn to_napi_value(
+        env: napi::sys::napi_env,
+        val: Self,
+    ) -> napi::Result<napi::sys::napi_value> {
+        let env = Env::from_raw(env);
+        let mut obj = Object::new(&env)?;
+
+        for (key, val) in val.map.into_iter() {
+            obj.set_named_property(&key.to_string(), unsafe {
+                ToNapiValue::to_napi_value(env.raw(), val.into())
+            }?)?;
+        }
+
+        Ok(obj.raw())
+    }
+}
+
+use std::{collections::HashMap, marker::PhantomData};
+
 pub(crate) use define_rust_to_js_convertible_object;
+use napi::{
+    Env, JsValue,
+    bindgen_prelude::{JsObjectValue, Object, ToNapiValue},
+};
